@@ -30,9 +30,15 @@ parser.add_argument(
     "The main code runs the main process, which makes it easier to \
     debug with checkpointing.",
 )
+parser.add_argument(
+    "--resume_dir",
+    type=str,
+    default=None,
+    help="If specified, resumes from this specific folder instead of creating a new timestamped one.",
+)
 
 
-def process_main(rank, fname, world_size, devices):
+def process_main(rank, fname, world_size, devices, run_id=None, resume_dir=None):
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(devices[rank].split(":")[-1])
@@ -55,6 +61,13 @@ def process_main(rank, fname, world_size, devices):
         params = yaml.load(y_file, Loader=yaml.FullLoader)
         logger.info("loaded params...")
 
+    # Override folder logic
+    if resume_dir is not None:
+        params["folder"] = resume_dir
+    else:
+        if run_id is not None:
+            params["folder"] = os.path.join(params["folder"], run_id)
+
     # Log config
     if rank == 0:
         pprint.PrettyPrinter(indent=4).pprint(params)
@@ -75,10 +88,14 @@ def process_main(rank, fname, world_size, devices):
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    
+    import datetime
+    run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
     if args.debugmode:
-        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
+        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"], run_id=run_id, resume_dir=args.resume_dir)
     else:
         num_gpus = len(args.devices)
         mp.set_start_method("spawn")
         for rank in range(num_gpus):
-            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices)).start()
+            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices, run_id, args.resume_dir)).start()

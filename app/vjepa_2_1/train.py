@@ -325,6 +325,11 @@ def main(args, resume_preempt=False):
         ("%d", "dataload-time(ms)"),
     )
 
+    tb_writer = None
+    if rank == 0:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=os.path.join(folder, "tensorboard"))
+
     # -- init model
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
@@ -520,6 +525,7 @@ def main(args, resume_preempt=False):
 
     trailing_losses = []
     step_count = 0
+    best_loss = float('inf')
 
     # -- TRAINING LOOP
     for epoch in range(start_epoch, num_epochs):
@@ -787,6 +793,11 @@ def main(args, resume_preempt=False):
                     gpu_etime_ms,
                     data_elapsed_time_ms,
                 )
+                if tb_writer is not None:
+                    global_step = epoch * ipe + itr
+                    tb_writer.add_scalar("Train/Loss", loss, global_step)
+                    tb_writer.add_scalar("Train/LR", _new_lr, global_step)
+                    tb_writer.add_scalar("Train/WD", _new_wd, global_step)
                 if (
                     (itr % log_freq == 0)
                     or (itr == ipe - 1)
@@ -827,6 +838,14 @@ def main(args, resume_preempt=False):
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
+        
+        # Save best checkpoint
+        if loss_meter.avg < best_loss:
+            best_loss = loss_meter.avg
+            logger.info("New best loss %.3f achieved. Saving best checkpoint." % best_loss)
+            best_path = os.path.join(folder, "best.pth.tar")
+            save_checkpoint(epoch + 1, best_path)
+
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:
