@@ -32,3 +32,4 @@ app/vjepa_droid_v4/local/
 configs/local
 *.gz
 runs
+attention_results
