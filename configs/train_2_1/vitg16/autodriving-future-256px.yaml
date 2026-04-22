@@ -57,8 +57,10 @@ mask:
   max_temporal_keep: 0.75
   num_blocks: 1
   spatial_scale:
-  - 0.15
-  - 0.15
+  - 0.0
+  - 0.0
+  # マスクする割合
+  # 最小　最高
   temporal_scale:
   - 1.0
   - 1.0
@@ -106,13 +108,13 @@ optimization:
   ema:
   - 0.99925
   - 0.99925
-  epochs: 100
-  final_lr: 0.0006
+  epochs: 50
+  final_lr: 0.0012
   final_weight_decay: 0.04
   ipe: 300
   ipe_scale: 1.25
-  lr: 0.0006
+  lr: 0.0012
   start_lr: 0.0001
-  warmup: 10
+  warmup: 5
   #10
   weight_decay: 0.04

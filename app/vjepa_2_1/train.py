@@ -54,6 +54,7 @@ torch.backends.cudnn.benchmark = True
 logger = get_logger(__name__, force=True)
 
 
+
 def main(args, resume_preempt=False):
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
@@ -136,6 +137,16 @@ def main(args, resume_preempt=False):
     crop_size = cfgs_data.get("crop_size", 224)
     patch_size = cfgs_data.get("patch_size")
     grid_size = crop_size // patch_size
+    # Boundary patch index beyond which patches belong to masked latter-half frames.
+    # E.g. max_temporal_keep=0.5: context uses tubelets 0..3, future is tubelets 4..7.
+    _max_temporal_keep = cfgs_mask[0].get("max_temporal_keep", 1.0)
+    _vid_duration = max(dataset_fpcs) // tubelet_size
+    _max_ctx_duration = max(1, int(_vid_duration * _max_temporal_keep))
+    temporal_cutoff = _max_ctx_duration * grid_size * grid_size
+    logger.info(
+        f"temporal_cutoff={temporal_cutoff} "
+        f"(ctx_tubelets={_max_ctx_duration}/{_vid_duration}, grid={grid_size}x{grid_size})"
+    )
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
 
@@ -364,6 +375,7 @@ def main(args, resume_preempt=False):
         modality_embedding=modality_embedding,
     )
     target_encoder = copy.deepcopy(encoder)
+
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
@@ -684,29 +696,45 @@ def main(args, resume_preempt=False):
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
-                    loss = 0
-                    loss_pred = loss_fn(
-                        z_pred, h, masks_pred, cls_loss=has_cls_first, d_weights=None
-                    )
-                    loss += loss_pred
 
-                    # Context loss
-                    if predict_all:
-                        distance_weights = compute_mask_distance(
-                            masks_pred, masks_enc, grid_size, offset_context_loss
-                        )
-                        if weight_distance_loss:
-                            d_weights = distance_weights
-                        else:
-                            d_weights = None
-                        loss_context = loss_fn(
-                            z_context, h, masks_enc, cls_loss=False, d_weights=d_weights
-                        )
-                        if lambda_progressive:
-                            lambda_value_step = lambda_sched.value(epoch * ipe + itr)
-                        else:
-                            lambda_value_step = lambda_value
-                        loss += loss_context * lambda_value_step
+                    def compute_future_only_loss(z_pred_nested, h_all_nested, masks_pred_nested):
+                        """
+                        Feature-space MAE comparing Target Encoder vs Predictor
+                        restricted to masked LATTER-HALF frames only.
+
+                        Ground truth : h_all[patch_idx] for patch_idx >= temporal_cutoff
+                        Prediction   : z_pred at the same positions
+                        """
+                        total_loss, n = 0, 0
+                        for z_fpc, hi_all, masks_fpc in zip(
+                            z_pred_nested, h_all_nested, masks_pred_nested
+                        ):
+                            # hi_all: [B, N_all, D]  (all patches from target encoder)
+                            # z_fpc:  list of [B, K_pred, D]
+                            # masks_fpc: list of [B, K_pred] patch indices
+                            for zij, mask_ij in zip(z_fpc, masks_fpc):
+                                # Boolean mask over K_pred: True = latter-half patch
+                                future_col = mask_ij[0] >= temporal_cutoff  # [K_pred]
+                                if future_col.sum() == 0:
+                                    continue
+
+                                # Predicted features for latter-half patches
+                                zij_future = zij[:, future_col, :]  # [B, K_future, D]
+
+                                # Target features: gather from hi_all at actual patch idx
+                                fut_idx = mask_ij[:, future_col]    # [B, K_future]
+                                B, K_future, D = zij_future.shape
+                                gather_idx = fut_idx.unsqueeze(-1).expand(B, K_future, D)
+                                h_future = torch.gather(hi_all, dim=1, index=gather_idx)
+
+                                total_loss += (
+                                    torch.mean(torch.abs(zij_future - h_future) ** loss_exp)
+                                    / loss_exp
+                                )
+                                n += 1
+                        return total_loss / max(n, 1)
+
+                    loss = compute_future_only_loss(z_pred, h, masks_pred)
 
                 # Step 2. Backward & step
                 run_step = True
