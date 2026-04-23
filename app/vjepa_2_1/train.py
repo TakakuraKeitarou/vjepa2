@@ -89,6 +89,8 @@ def main(args, resume_preempt=False):
     # -- MODEL
     cfgs_model = args.get("model")
     compile_model = cfgs_model.get("compile_model", False)
+    use_decoder = cfgs_model.get("use_decoder", False)
+    train_decoder_only = cfgs_model.get("train_decoder_only", False)
     use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
     model_name = cfgs_model.get("model_name")
     pred_depth = cfgs_model.get("pred_depth")
@@ -143,8 +145,23 @@ def main(args, resume_preempt=False):
     _vid_duration = max(dataset_fpcs) // tubelet_size
     _max_ctx_duration = max(1, int(_vid_duration * _max_temporal_keep))
     temporal_cutoff = _max_ctx_duration * grid_size * grid_size
+    
+    # -- LOSS Config Read for target frames
+    cfgs_loss = args.get("loss", {})
+    loss_target_frames = cfgs_loss.get("loss_target_frames", None)
+    if loss_target_frames is not None:
+        start_frame, end_frame = loss_target_frames
+        start_tubelet = start_frame // tubelet_size
+        end_tubelet = end_frame // tubelet_size
+        loss_start_patch = start_tubelet * grid_size * grid_size
+        loss_end_patch = (end_tubelet + 1) * grid_size * grid_size
+    else:
+        # Default: Boundary patch index for the LAST frame (last tubelet)
+        loss_start_patch = (_vid_duration - 1) * grid_size * grid_size
+        loss_end_patch = _vid_duration * grid_size * grid_size
+    
     logger.info(
-        f"temporal_cutoff={temporal_cutoff} "
+        f"temporal_cutoff={temporal_cutoff}, loss_target_patches=[{loss_start_patch}, {loss_end_patch}) "
         f"(ctx_tubelets={_max_ctx_duration}/{_vid_duration}, grid={grid_size}x{grid_size})"
     )
     pin_mem = cfgs_data.get("pin_mem", False)
@@ -376,6 +393,22 @@ def main(args, resume_preempt=False):
     )
     target_encoder = copy.deepcopy(encoder)
 
+    # ---- Decoder for verification ----
+    if use_decoder:
+        from app.vjepa_2_1.models.diffusion_decoder import PatchDiffusionDecoder
+        decoder = PatchDiffusionDecoder(
+            embed_dim=pred_embed_dim, 
+            patch_dim=3 * model_tubelet_size * patch_size * patch_size
+        ).to(device)
+
+        def patchify(imgs, p_size, t_size):
+            B, C, T, H, W = imgs.shape
+            h, w, l = H // p_size, W // p_size, max(1, T // t_size)
+            t_size = min(T, t_size)
+            x = imgs.reshape(B, C, l, t_size, h, p_size, w, p_size)
+            x = x.permute(0, 2, 4, 6, 3, 5, 7, 1)
+            x = x.reshape(B, l * h * w, t_size * p_size * p_size * C)
+            return x
 
     if compile_model:
         logger.info("Compiling encoder, target_encoder, and predictor.")
@@ -458,6 +491,9 @@ def main(args, resume_preempt=False):
         predictor, static_graph=False, find_unused_parameters=True
     )
     target_encoder = DistributedDataParallel(target_encoder)
+    if use_decoder:
+        decoder_opt = torch.optim.AdamW(decoder.parameters(), lr=start_lr)
+        decoder = DistributedDataParallel(decoder, static_graph=True)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -510,6 +546,9 @@ def main(args, resume_preempt=False):
             "world_size": world_size,
             "lr": lr,
         }
+        if use_decoder:
+            save_dict["decoder"] = decoder.state_dict()
+            save_dict["decoder_opt"] = decoder_opt.state_dict()
         try:
             torch.save(save_dict, path)
         except Exception as e:
@@ -644,6 +683,35 @@ def main(args, resume_preempt=False):
                             z_context = normalize_nested(z_context, embed_dim)
                     return z_pred, z_context
 
+                def compute_future_only_loss(z_pred_nested, h_all_nested, masks_pred_nested):
+                    """
+                    Feature-space MAE comparing Target Encoder vs Predictor
+                    restricted to the LAST frame (last tubelet) only.
+
+                    Ground truth : h_all[patch_idx] for patch_idx >= last_frame_cutoff
+                    Prediction   : z_pred at the same positions
+                    """
+                    total_loss, n = 0, 0
+                    for z_fpc, hi_all, masks_fpc in zip(
+                        z_pred_nested, h_all_nested, masks_pred_nested
+                    ):
+                        for zij, mask_ij in zip(z_fpc, masks_fpc):
+                            future_col = (mask_ij[0] >= loss_start_patch) & (mask_ij[0] < loss_end_patch)
+                            if future_col.sum() == 0:
+                                continue
+                            zij_future = zij[:, future_col, :]
+                            fut_idx = mask_ij[:, future_col]
+                            B_val, K_future, D_val = zij_future.shape
+                            gather_idx = fut_idx.unsqueeze(-1).expand(B_val, K_future, D_val)
+                            h_future = torch.gather(hi_all, dim=1, index=gather_idx)
+
+                            total_loss += (
+                                torch.mean(torch.abs(zij_future - h_future) ** loss_exp)
+                                / loss_exp
+                            )
+                            n += 1
+                    return total_loss / max(n, 1)
+
                 def loss_fn(z, h, masks_to_apply, cls_loss, d_weights):
                     if cls_loss:
                         h_cls = [hi[:, 0].unsqueeze(1) for hi in h]
@@ -694,50 +762,18 @@ def main(args, resume_preempt=False):
 
                 # Step 1. Forward
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                    h = forward_target(clips)
-                    z_pred, z_context = forward_context(clips)
-
-                    def compute_future_only_loss(z_pred_nested, h_all_nested, masks_pred_nested):
-                        """
-                        Feature-space MAE comparing Target Encoder vs Predictor
-                        restricted to masked LATTER-HALF frames only.
-
-                        Ground truth : h_all[patch_idx] for patch_idx >= temporal_cutoff
-                        Prediction   : z_pred at the same positions
-                        """
-                        total_loss, n = 0, 0
-                        for z_fpc, hi_all, masks_fpc in zip(
-                            z_pred_nested, h_all_nested, masks_pred_nested
-                        ):
-                            # hi_all: [B, N_all, D]  (all patches from target encoder)
-                            # z_fpc:  list of [B, K_pred, D]
-                            # masks_fpc: list of [B, K_pred] patch indices
-                            for zij, mask_ij in zip(z_fpc, masks_fpc):
-                                # Boolean mask over K_pred: True = latter-half patch
-                                future_col = mask_ij[0] >= temporal_cutoff  # [K_pred]
-                                if future_col.sum() == 0:
-                                    continue
-
-                                # Predicted features for latter-half patches
-                                zij_future = zij[:, future_col, :]  # [B, K_future, D]
-
-                                # Target features: gather from hi_all at actual patch idx
-                                fut_idx = mask_ij[:, future_col]    # [B, K_future]
-                                B, K_future, D = zij_future.shape
-                                gather_idx = fut_idx.unsqueeze(-1).expand(B, K_future, D)
-                                h_future = torch.gather(hi_all, dim=1, index=gather_idx)
-
-                                total_loss += (
-                                    torch.mean(torch.abs(zij_future - h_future) ** loss_exp)
-                                    / loss_exp
-                                )
-                                n += 1
-                        return total_loss / max(n, 1)
-
-                    loss = compute_future_only_loss(z_pred, h, masks_pred)
+                    if train_decoder_only:
+                        with torch.no_grad():
+                            h = forward_target(clips)
+                            z_pred, z_context = forward_context(clips)
+                            loss = compute_future_only_loss(z_pred, h, masks_pred)
+                    else:
+                        h = forward_target(clips)
+                        z_pred, z_context = forward_context(clips)
+                        loss = compute_future_only_loss(z_pred, h, masks_pred)
 
                 # Step 2. Backward & step
-                run_step = True
+                run_step = not train_decoder_only
                 if loss_reg_std_mult is not None:
                     meanval = np.mean(trailing_losses)
                     stdval = np.std(trailing_losses)
@@ -766,6 +802,48 @@ def main(args, resume_preempt=False):
                     else:
                         optimizer.step()
                 optimizer.zero_grad()
+
+                # --- Decoder Loss Loop ---
+                if run_step and use_decoder:
+                    with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                        target_patches = patchify(clips, patch_size, model_tubelet_size)
+                        dec_loss, n_dec = 0, 0
+                        for z_fpc, masks_fpc in zip(z_pred, masks_pred):
+                            for zij, mask_ij in zip(z_fpc, masks_fpc):
+                                B_z, K_z, D_z = zij.shape
+                                zij_detached = zij.detach()
+                                gather_idx = mask_ij.unsqueeze(-1).expand(B_z, K_z, target_patches.size(-1))
+                                targ_p = torch.gather(target_patches, dim=1, index=gather_idx)
+
+                                # バッチサイズxパッチ数でフラット化
+                                targ_p_flat = targ_p.reshape(-1, targ_p.size(-1))
+                                c_flat = zij_detached.reshape(-1, D_z)
+
+                                N = targ_p_flat.shape[0]
+                                diff_t = torch.randint(0, decoder.module.timesteps, (N,), device=targ_p_flat.device).long()
+                                noise = torch.randn_like(targ_p_flat)
+                                a_bar = decoder.module.alpha_bar[diff_t].unsqueeze(-1)
+                                
+                                # ノイズ付与されたパッチを生成
+                                x_t = torch.sqrt(a_bar) * targ_p_flat + torch.sqrt(1. - a_bar) * noise
+                                
+                                # Diffusionデコーダによるノイズ予測
+                                pred_noise = decoder(x_t, diff_t, c_flat)
+                                
+                                # εのMSE Loss
+                                dec_loss += torch.mean((pred_noise - noise) ** 2)
+                                n_dec += 1
+
+                        if n_dec > 0:
+                            dec_loss = dec_loss / max(n_dec, 1)
+                            if mixed_precision:
+                                scaler.scale(dec_loss).backward()
+                                scaler.step(decoder_opt)
+                            else:
+                                dec_loss.backward()
+                                decoder_opt.step()
+                        decoder_opt.zero_grad()
+                # -------------------------
 
                 # Step 3. momentum update of target encoder
                 m = min(next(momentum_scheduler), ema[1])

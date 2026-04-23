@@ -43,7 +43,8 @@ loss:
   weight_distance_loss: true
   # 【設定項目③】損失計算に用いるフレームの範囲（開始と終了のインデックス）
   # 例えば 16フレームのうち最後の2フレーム（14フレーム目と15フレーム目）のみを使う場合:
-  loss_target_frames: [14, 15]
+  loss_target_frames: [12,15]
+
 
 mask:
 - aspect_ratio:
@@ -72,12 +73,14 @@ mask:
 meta:
   dtype: bfloat16
   eval_freq: 100
-  load_checkpoint: false
-  read_checkpoint: null
+  load_checkpoint: true
+  read_checkpoint: /home/thoth-22/kei_ws/vjepa2/runs/vjepa_2_1/autodriving_future/20260420_182802/best.pth.tar
   save_every_freq: 50
   seed: 239
   use_sdpa: true
 model:
+  use_decoder: true
+  train_decoder_only: true
   has_cls_first: false
   img_temporal_dim_size: 1
   interpolate_rope: true
