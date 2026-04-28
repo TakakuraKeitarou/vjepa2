@@ -396,8 +396,12 @@ def main(args, resume_preempt=False):
     # ---- Decoder for verification ----
     if use_decoder:
         from app.vjepa_2_1.models.diffusion_decoder import PatchDiffusionDecoder
+        
+        levels_predictor = cfgs_model.get("n_output_distillation", 4)
+        decoder_input_dim = encoder.backbone.embed_dim * levels_predictor
+
         decoder = PatchDiffusionDecoder(
-            embed_dim=pred_embed_dim, 
+            embed_dim=decoder_input_dim, 
             patch_dim=3 * model_tubelet_size * patch_size * patch_size
         ).to(device)
 
@@ -493,7 +497,7 @@ def main(args, resume_preempt=False):
     target_encoder = DistributedDataParallel(target_encoder)
     if use_decoder:
         decoder_opt = torch.optim.AdamW(decoder.parameters(), lr=start_lr)
-        decoder = DistributedDataParallel(decoder, static_graph=True)
+        decoder = DistributedDataParallel(decoder)
     for p in target_encoder.parameters():
         p.requires_grad = False
 
@@ -798,17 +802,16 @@ def main(args, resume_preempt=False):
                         loss.backward()
                     if mixed_precision:
                         scaler.step(optimizer)
-                        scaler.update()
                     else:
                         optimizer.step()
                 optimizer.zero_grad()
 
                 # --- Decoder Loss Loop ---
-                if run_step and use_decoder:
+                if use_decoder:
                     with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
-                        target_patches = patchify(clips, patch_size, model_tubelet_size)
                         dec_loss, n_dec = 0, 0
-                        for z_fpc, masks_fpc in zip(z_pred, masks_pred):
+                        for clip_fpc, z_fpc, masks_fpc in zip(clips, z_pred, masks_pred):
+                            target_patches = patchify(clip_fpc, patch_size, model_tubelet_size)
                             for zij, mask_ij in zip(z_fpc, masks_fpc):
                                 B_z, K_z, D_z = zij.shape
                                 zij_detached = zij.detach()
@@ -843,6 +846,10 @@ def main(args, resume_preempt=False):
                                 dec_loss.backward()
                                 decoder_opt.step()
                         decoder_opt.zero_grad()
+                
+                # Update scaler after all optimizers have stepped
+                if mixed_precision and (run_step or use_decoder):
+                    scaler.update()
                 # -------------------------
 
                 # Step 3. momentum update of target encoder
@@ -858,11 +865,13 @@ def main(args, resume_preempt=False):
                     torch._foreach_mul_(params_k, m)
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
+                _dec_loss_ret = float(dec_loss) if use_decoder else 0.0
                 return (
                     float(loss),
                     _new_lr,
                     _new_wd,
                     run_step,
+                    _dec_loss_ret,
                 )
 
             (
@@ -870,6 +879,7 @@ def main(args, resume_preempt=False):
                 _new_lr,
                 _new_wd,
                 run_step,
+                dec_loss_val,
             ), gpu_etime_ms = gpu_timer(train_step)
             iter_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
             loss_meter.update(loss)
@@ -904,13 +914,15 @@ def main(args, resume_preempt=False):
                     tb_writer.add_scalar("Train/Loss", loss, global_step)
                     tb_writer.add_scalar("Train/LR", _new_lr, global_step)
                     tb_writer.add_scalar("Train/WD", _new_wd, global_step)
+                    if use_decoder and dec_loss_val > 0.0:
+                        tb_writer.add_scalar("Train/DecoderLoss", dec_loss_val, global_step)
                 if (
                     (itr % log_freq == 0)
                     or (itr == ipe - 1)
                     or np.isnan(loss)
                     or np.isinf(loss)
                 ):
-                    logger.info(
+                    log_str = (
                         "[%d, %5d] loss: %.3f "
                         "masks: %s "
                         "[wd: %.2e] [lr: %.2e] "
@@ -918,26 +930,25 @@ def main(args, resume_preempt=False):
                         "[iter: %.1f ms] "
                         "[gpu: %.1f ms] "
                         "[data: %.1f ms]"
-                        % (
-                            epoch + 1,
-                            itr,
-                            loss_meter.avg,
-                            "["
-                            + ", ".join(
-                                [
-                                    f"{k}: " + "%.1f" % mask_meters[k].avg
-                                    for k in mask_meters
-                                ]
-                            )
-                            + "]",
-                            _new_wd,
-                            _new_lr,
-                            torch.cuda.max_memory_allocated() / 1024.0**2,
-                            iter_time_meter.avg,
-                            gpu_time_meter.avg,
-                            data_elapsed_time_meter.avg,
-                        )
                     )
+                    log_args = [
+                        epoch + 1,
+                        itr,
+                        loss_meter.avg,
+                        "[" + ", ".join([f"{k}: " + "%.1f" % mask_meters[k].avg for k in mask_meters]) + "]",
+                        _new_wd,
+                        _new_lr,
+                        torch.cuda.max_memory_allocated() / 1024.0**2,
+                        iter_time_meter.avg,
+                        gpu_time_meter.avg,
+                        data_elapsed_time_meter.avg,
+                    ]
+                    
+                    if use_decoder and dec_loss_val > 0.0:
+                        log_str += " [dec_loss: %.3f]"
+                        log_args.append(dec_loss_val)
+                        
+                    logger.info(log_str % tuple(log_args))
 
             log_stats()
             assert not np.isnan(loss), "loss is nan"

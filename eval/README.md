@@ -9,7 +9,8 @@ eval/
 ├── README.md                # このファイル
 ├── eval_world_model.py      # 未来予測Loss評価
 ├── vis_attention.py         # Attention Rollout 可視化
-└── vis_tsne.py              # t-SNE 特徴量クラスタリング
+├── vis_tsne.py              # t-SNE 特徴量クラスタリング
+└── vis_decoder.py           # ピクセル再構築（Diffusion Decoder）の可視化
 ```
 
 ## 前提条件
@@ -116,6 +117,30 @@ python eval/vis_tsne.py \
 
 ---
 
+### 4. デコーダによるピクセル再構築の可視化 (`vis_decoder.py`)
+
+学習した Diffusion Decoder を用いて、Predictor が予測した未来の特徴量から「実際のピクセル画像」をデノイジング・プロセスによって復元し、元の正解画像と並べて比較します。
+
+```bash
+python eval/vis_decoder.py \
+  --fname configs/train_2_1/vitg16/learn_decoder.yaml \
+  --ckpt runs/vjepa_2_1/autodriving_future/<日時フォルダ>/best.pth.tar \
+  --output_dir ./eval/decoder_outputs \
+  --num_samples 1
+```
+
+| 固有引数 | 説明 | デフォルト |
+|---|---|---|
+| `--num_samples` | 推論・生成するバッチ（サンプル）数 | `1` |
+| `--output_dir` | 比較画像の出力先ディレクトリ | `./eval/decoder_outputs` |
+
+**出力**: `decoder_outputs/sample_0_frame_00.png` 〜 等の連番画像
+各画像には、左側に「元の正解画像 (Ground Truth)」、右側に「対象領域をデコーダが生成で埋め戻した画像」が横に並んで表示されます。
+
+**何が分かるか**: モデル（Predictor）が予測した潜在特徴量が、そもそも視覚的・セマンティックな意味をどれくらい保持しているのか（画素レベルでの再構築能力）を、ピクセルレベルで視覚的に検証できます。
+
+---
+
 ## 各ツールで分かることの対応表
 
 | ツール | 将来予測の精度 | エンコーダの品質 |
@@ -123,5 +148,6 @@ python eval/vis_tsne.py \
 | `eval_world_model.py` | **直接測定** | 間接的 |
 | `vis_attention.py` | 間接的 | **直接確認** |
 | `vis_tsne.py` | 間接的 | **直接確認** |
+| `vis_decoder.py` | **直接確認(視覚)** | 間接的 |
 
 3つの結果を総合して「V-JEPA が自動運転映像から世界の物理法則を獲得できたか」を判断します。

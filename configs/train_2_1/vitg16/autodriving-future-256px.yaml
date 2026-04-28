@@ -43,7 +43,7 @@ loss:
   weight_distance_loss: true
   # 【設定項目③】損失計算に用いるフレームの範囲（開始と終了のインデックス）
   # 例えば 16フレームのうち最後の2フレーム（14フレーム目と15フレーム目）のみを使う場合:
-  loss_target_frames: [14, 15]
+  loss_target_frames: [12, 15]
 
 mask:
 - aspect_ratio:

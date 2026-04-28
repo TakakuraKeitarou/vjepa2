@@ -85,6 +85,10 @@ def process_main(rank, fname, world_size, devices, run_id=None, resume_dir=None)
     # Launch the app with loaded config
     app_main(params["app"], args=params)
 
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     args = parser.parse_args()
